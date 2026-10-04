@@ -1,0 +1,10 @@
+{
+  "replace": false,
+  "values": [
+    "minecraft:birch_forest",
+    "minecraft:jungle",
+    "#minecraft:is_forest",
+    "#minecraft:is_jungle",
+    "#c:is_dense_vegetation/overworld"
+  ]
+}

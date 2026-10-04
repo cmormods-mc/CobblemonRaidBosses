@@ -1,0 +1,10 @@
+{
+  "replace": false,
+  "values": [
+    "minecraft:jagged_peaks",
+    "minecraft:stony_peaks",
+    "#minecraft:is_mountain",
+    "#c:is_mountain",
+    "#c:is_mountain/peak"
+  ]
+}

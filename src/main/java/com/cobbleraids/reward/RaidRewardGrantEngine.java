@@ -1,0 +1,303 @@
+package com.cobbleraids.reward;
+
+import com.cobbleraids.RaidLog;
+import com.cobbleraids.config.CobbleRaidsConfigManager;
+import com.cobbleraids.config.RaidDefinition;
+import com.cobbleraids.config.RaidDefinitionRegistry;
+import com.cobbleraids.catching.RaidCaptureSessionService;
+import com.cobbleraids.catching.RaidPlayerRecords;
+import com.cobbleraids.config.RaidRewardPolicyManager;
+import com.cobbleraids.fault.RaidFaultBarrier;
+import com.cobbleraids.config.CobbleRaidsConfig;
+import com.cobbleraids.item.ItemGiving;
+import com.cobbleraids.item.RaidHeldItems;
+import com.cobbleraids.reward.currency.RaidCurrencyBackends;
+import com.cobbleraids.reward.points.RaidPointsStore;
+import com.cobbleraids.reward.plan.RewardPlan;
+import com.cobbleraids.reward.plan.RewardPlanResolver;
+import com.cobbleraids.renown.RenownRewards;
+import com.cobblemon.mod.common.Cobblemon;
+import com.cobblemon.mod.common.pokemon.Pokemon;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.item.Item;
+
+/** Server-authoritative item grant logic. SkiesGUIs never grants raid loot directly. */
+public final class RaidRewardGrantEngine {
+    private RaidRewardGrantEngine() {}
+
+    /**
+     * Grants one claim.
+     *
+     * <p>Nothing here decides what a reward is. {@link RewardPlanResolver} does that, once, and
+     * hands back a plan; this rolls it. The split matters because the two used to be tangled: this
+     * method read a loot-table field on the choice and another on the rewards block and rolled
+     * both, so a definition carrying both handed out both. A plan has one table list.
+     */
+    public static RewardGrantResult grantChoice(ServerPlayer player, PendingRaidReward pending,
+                                                RaidDefinition.RewardChoice choice) {
+        ResourceLocation definitionId = pending.definitionId();
+        RaidDefinition definition = RaidDefinitionRegistry.get(definitionId);
+        String species = definition == null ? null : definition.species().getPath();
+
+        int sinceStone = RaidPlayerRecords.get(player.getUUID()).raidsSinceMegaStone();
+        RewardPlan plan = RewardPlanResolver.resolve(
+                pending.rewards(), choice, pending.rarityTier(), species,
+                pending.contributionPercentage(), pending.contributionBonusRolls(),
+                RaidRewardPolicyManager.get(), CobbleRaidsConfigManager.get().currency(),
+                table -> RaidLootRoller.exists(player, parse(table, definitionId)),
+                sinceStone, CobbleRaidsConfigManager.get().megaPity());
+
+        // One generator per claim, seeded from the claim token, handing a fresh sub-seed to each
+        // selection. Reusing the claim seed directly for every roll would make all of a bundle's
+        // general selections identical -- reproducible, and useless.
+        Random claimRandom = new Random(pending.rewardSeed());
+        BigInteger currency = renownCurrency(plan.currency(), pending);
+        RewardGrantResult result;
+        result = switch (plan) {
+            case RewardPlan.Policy policy -> grantPolicy(player, definitionId, policy, claimRandom, currency);
+            case RewardPlan.Legacy legacy -> grantLegacy(player, definitionId, legacy, claimRandom, currency);
+        };
+        result = result.withPoints(awardPoints(player, pending));
+        if (plan instanceof RewardPlan.Policy policy && policy.megaCapable()) {
+            recordMegaCapableClaim(player, result, sinceStone);
+        }
+        if (CobbleRaidsConfigManager.get().debugLogging()) {
+            RaidLog.info("" + definitionId + " granted via the " + plan.mode() + " path: "
+                    + plan.lootTables().size() + " table roll(s)");
+        }
+        return result;
+    }
+
+    /**
+     * Credits the claim's Raid Points -- or, if a Raid Capture Protocol session is waiting on exactly
+     * this raid for this player, withholds them instead and reports the same figure back as
+     * "granted" anyway (see {@link RaidCaptureSessionService#onRewardClaimed}). The player's item
+     * rewards above are entirely unaffected either way; this interception is scoped to the points
+     * figure alone, and happens only now -- after the items are already placed -- specifically so
+     * capturing never gates or delays the ordinary reward claim, only redirects its RP.
+     *
+     * <p>Flat per tier and per claim: every eligible participant fought the same raid, and the
+     * reward for contributing more is the extra loot selections, which already scale. Computed
+     * after the items are in hand and guarded, because a currency this mod invented must never be
+     * the reason a player loses loot they won.
+     */
+    private static int awardPoints(ServerPlayer player, PendingRaidReward pending) {
+        CobbleRaidsConfig.RaidPoints config = CobbleRaidsConfigManager.get().raidPoints();
+        int computed = 0;
+        if (config.enabled() && !config.isNoOp()) {
+            int base = config.pointsFor(pending.rarityTier());
+            int amount = pending.renowned()
+                    ? RenownRewards.points(base, CobbleRaidsConfigManager.get().renown().pointsMultiplier())
+                    : base;
+            computed = Math.max(0, carryingRaidCore(player)
+                    ? RenownRewards.points(amount, RAID_CORE_POINTS_MULTIPLIER) : amount);
+        }
+        final int finalAmount = computed;
+
+        // Always checked, even when RaidPoints itself is off (finalAmount 0): a waiting capture
+        // session has no other event to promote it on, and skipping this call whenever there is
+        // nothing to withhold would strand that player's session in AWAITING_CLAIM permanently,
+        // silently, the moment an operator disables the currency the capture protocol wagers.
+        boolean[] intercepted = { false };
+        RaidFaultBarrier.guard("reward:raid-points-capture-check", () ->
+                intercepted[0] = RaidCaptureSessionService.onRewardClaimed(player, pending.raidId(), finalAmount));
+        if (intercepted[0]) return finalAmount;
+        if (finalAmount <= 0) return 0;
+
+        int[] awarded = { 0 };
+        RaidFaultBarrier.guard("reward:raid-points", () -> {
+            RaidPointsStore.award(player.getServer(), player.getUUID(), finalAmount);
+            awarded[0] = finalAmount;
+            RaidFaultBarrier.guard("stats:points", () ->
+                    com.cobbleraids.stats.RaidStats.onPointsEarned(player.getServer(), player.getUUID(), finalAmount));
+        });
+        return awarded[0];
+    }
+
+    /** Raid Core's whole effect: a flat bonus on the points a claim was already going to pay. */
+    private static final double RAID_CORE_POINTS_MULTIPLIER = 1.20;
+
+    /**
+     * Whether any Pokemon in this player's party is holding a Raid Core right now, at the moment
+     * they claim their reward -- not at the moment the boss fell, the way {@link
+     * com.cobbleraids.catching.TrophyLedger}'s win-time hook works. A claim can be made well after
+     * the raid ends (see {@link PendingRewardStore}), and re-checking a snapshot of who held what
+     * mid-battle would need plumbing this engine has no other reason to carry. Guarded because
+     * scanning party storage is Cobblemon's code, not this mod's, and a bonus item must never be
+     * able to cost a player the reward itself.
+     */
+    private static boolean carryingRaidCore(ServerPlayer player) {
+        Item raidCore = RaidHeldItems.raidCore();
+        if (raidCore == null) return false;
+        boolean[] found = { false };
+        RaidFaultBarrier.guard("reward:raid-core-check", () -> {
+            for (Pokemon pokemon : Cobblemon.INSTANCE.getStorage().getParty(player)) {
+                if (pokemon.heldItem().getItem() == raidCore) {
+                    found[0] = true;
+                    return;
+                }
+            }
+        });
+        return found[0];
+    }
+
+    /**
+     * Advances or resets the player's Mega Stone counter, and says so when the guarantee fired.
+     *
+     * <p>Guarded: bad-luck protection failing must never cost somebody the reward they just won.
+     * The worst case is a counter that does not move, which delays a guarantee rather than
+     * breaking a claim.
+     */
+    private static void recordMegaCapableClaim(ServerPlayer player, RewardGrantResult result, int sinceStone) {
+        RaidFaultBarrier.guard("reward:mega-pity", () -> {
+            boolean stone = result.allGranted().stream()
+                    .anyMatch(item -> RaidMegaPity.isMegaStone(item.item().toString()));
+            RaidPlayerRecords.recordMegaCapableClaim(player.getServer(), player.getUUID(), stone);
+            if (stone && sinceStone > 0 && CobbleRaidsConfigManager.get().debugLogging()) {
+                RaidLog.info("{} received a Mega Stone after {} mega-capable raid(s) without one",
+                        player.getGameProfile().getName(), sinceStone);
+            }
+        });
+    }
+
+    /**
+     * Renown's currency multiplier, applied to whatever the plan decided. Here rather than in
+     * RewardPlanResolver so the resolver keeps answering "what does this tier pay" and renown stays
+     * one visible step on top of it.
+     */
+    private static BigInteger renownCurrency(BigInteger base, PendingRaidReward pending) {
+        return pending.renowned()
+                ? RenownRewards.currency(base, CobbleRaidsConfigManager.get().renown().currencyMultiplier())
+                : base;
+    }
+
+    /** Policy path: roll each table in the plan once, then pay. Every selection is one table roll. */
+    private static RewardGrantResult grantPolicy(ServerPlayer player, ResourceLocation definitionId,
+                                                 RewardPlan.Policy plan, Random claimRandom, BigInteger currency) {
+        List<RaidDefinition.RewardItem> standard = new ArrayList<>();
+        List<RaidDefinition.RewardItem> bonus = new ArrayList<>();
+        // The general rolls are the tail of the plan's list, and the last `bonusGeneralRolls` of
+        // them are what contribution earned -- reported separately so a claim log can say what a
+        // player's damage share actually bought. This reads position, so it is only correct while
+        // the resolver keeps the general rolls last; RewardPlan.Policy says so, and
+        // planOrderKeepsBonusRollsLast fails if that stops being true.
+        int firstBonusIndex = plan.lootTables().size() - plan.bonusGeneralRolls();
+        for (int index = 0; index < plan.lootTables().size(); index++) {
+            ResourceLocation tableId = parse(plan.lootTables().get(index), definitionId);
+            if (tableId == null) continue;
+            List<RaidDefinition.RewardItem> rolled = RaidLootRoller.rollAll(
+                    player, List.of(tableId), definitionId, nextSeed(claimRandom));
+            (index >= firstBonusIndex ? bonus : standard).addAll(rolled);
+        }
+        return new RewardGrantResult(standard, List.of(), bonus,
+                payCurrency(player, definitionId, currency), 0);
+    }
+
+    /** Legacy path: exactly what a hand-written definition did before the policy existed. */
+    private static RewardGrantResult grantLegacy(ServerPlayer player, ResourceLocation definitionId,
+                                                 RewardPlan.Legacy plan, Random claimRandom, BigInteger currency) {
+        List<RaidDefinition.RewardItem> base = new ArrayList<>();
+        for (RaidDefinition.RewardItem item : plan.items()) {
+            if (give(player, item, definitionId)) base.add(item);
+        }
+        List<RaidDefinition.RewardItem> chanceGranted = new ArrayList<>();
+        for (RaidDefinition.RewardItem item : plan.chanceItems()) {
+            if (claimRandom.nextDouble() < item.chance() && give(player, item, definitionId)) {
+                chanceGranted.add(item);
+            }
+        }
+        // Loot tables borrow another mod's own balancing instead of restating it item by item.
+        List<ResourceLocation> tables = new ArrayList<>();
+        for (String table : plan.lootTables()) {
+            ResourceLocation parsed = parse(table, definitionId);
+            if (parsed != null) tables.add(parsed);
+        }
+        base.addAll(RaidLootRoller.rollAll(player, tables, definitionId, nextSeed(claimRandom)));
+
+        List<RaidDefinition.RewardItem> bonusGranted = new ArrayList<>();
+        for (int index = 0; index < plan.bonusRolls() && !plan.bonusPool().isEmpty(); index++) {
+            RaidDefinition.RewardItem rolled = weighted(plan.bonusPool(), claimRandom);
+            if (give(player, rolled, definitionId)) bonusGranted.add(rolled);
+        }
+        return new RewardGrantResult(base, chanceGranted, bonusGranted,
+                payCurrency(player, definitionId, currency), 0);
+    }
+
+    private static ResourceLocation parse(String tableId, ResourceLocation definitionId) {
+        ResourceLocation parsed = ResourceLocation.tryParse(tableId);
+        if (parsed == null) {
+            RaidLog.error("" + definitionId + " names loot table '" + tableId
+                    + "', which is not a valid resource location; skipping it.");
+        }
+        return parsed;
+    }
+
+    /** RANDOMIZE_SEED means "roll freely" to the loot API, so it must never be handed out as a seed. */
+    private static long nextSeed(Random claimRandom) {
+        long seed = claimRandom.nextLong();
+        return seed == net.minecraft.world.level.storage.loot.LootTable.RANDOMIZE_SEED ? 1L : seed;
+    }
+
+    static RaidDefinition.RewardItem weighted(List<RaidDefinition.RewardItem> pool, Random random) {
+        long total = 0;
+        for (RaidDefinition.RewardItem item : pool) total += item.weight();
+        long roll = Math.floorMod(random.nextLong(), total);
+        for (RaidDefinition.RewardItem item : pool) {
+            roll -= item.weight();
+            if (roll < 0) return item;
+        }
+        return pool.get(pool.size() - 1);
+    }
+
+    /**
+     * Credits the claim's currency, if any, through whichever economy backend is active.
+     *
+     * <p>Runs last and cannot throw. RaidRewardService restores the whole claim when granting
+     * throws, so a failure here after the items were placed would return a claim the player has
+     * already been paid for -- the same duplication hazard give() documents. The backend contract
+     * is to report false rather than throw; this guard is the belt to that braces, because the
+     * backend is the one place in this path that calls into another mod.
+     */
+    private static BigInteger payCurrency(ServerPlayer player, ResourceLocation definitionId, BigInteger amount) {
+        if (amount == null || amount.signum() <= 0) return BigInteger.ZERO;
+        try {
+            if (RaidCurrencyBackends.active().grant(player, amount)) return amount;
+            RaidLog.warn("Raid currency payout of " + amount + " for " + definitionId
+                    + " was not credited by backend '" + RaidCurrencyBackends.active().name()
+                    + "'; the item rewards were granted normally.");
+            return BigInteger.ZERO;
+        } catch (RuntimeException ex) {
+            RaidLog.error("Raid currency payout failed for " + definitionId
+                    + "; the item rewards were granted normally.", ex);
+            return BigInteger.ZERO;
+        }
+    }
+
+    /**
+     * Places one reward line in the inventory. Returns false, having granted nothing, when the item
+     * does not resolve.
+     *
+     * <p>It used to throw. That was actively harmful once a definition could name another mod's
+     * item: RaidRewardService consumes the claim before granting and restores it if granting
+     * throws, so an unresolvable item halfway down a list meant the player kept everything already
+     * handed out AND kept the claim -- a duplication bug on every retry, and a reward that could
+     * never be completed. Skipping the line leaves the rest of the reward intact and the claim
+     * properly spent, which is what a modpack that has just dropped a mod needs.
+     */
+    private static boolean give(ServerPlayer player, RaidDefinition.RewardItem reward, ResourceLocation definitionId) {
+        Item item = BuiltInRegistries.ITEM.get(reward.item());
+        if (!BuiltInRegistries.ITEM.getKey(item).equals(reward.item())) {
+            RaidLog.error("" + definitionId + " reward item '" + reward.item()
+                    + "' is not registered; skipping it. Is the mod that owns it installed?");
+            return false;
+        }
+        ItemGiving.giveStacked(player, item, reward.amount());
+        return true;
+    }
+}

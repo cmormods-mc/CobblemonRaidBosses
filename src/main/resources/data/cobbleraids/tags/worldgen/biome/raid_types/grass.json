@@ -1,0 +1,10 @@
+{
+  "replace": false,
+  "values": [
+    "minecraft:forest",
+    "minecraft:flower_forest",
+    "#minecraft:is_forest",
+    "#c:is_floral",
+    "#c:is_lush"
+  ]
+}

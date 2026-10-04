@@ -1,0 +1,12 @@
+{
+  "replace": false,
+  "values": [
+    "minecraft:river",
+    "minecraft:beach",
+    "#c:is_aquatic",
+    "#c:is_river",
+    "#c:is_ocean",
+    "#minecraft:is_beach",
+    "#c:is_wet/overworld"
+  ]
+}

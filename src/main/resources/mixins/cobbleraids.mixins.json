@@ -1,0 +1,31 @@
+{
+  "required": true,
+  "package": "com.cobbleraids.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "showdown.ShowdownResourceLoaderMixin",
+    "showdown.ShowdownContextBootMixin",
+    "battle.RaidBattleRegistryMixin",
+    "battle.RaidBossBattleStartGuardMixin",
+    "battle.RaidBossInvulnerabilityMixin",
+    "battle.RaidBossPushImmunityMixin",
+    "battle.RaidBossFishingImmunityMixin",
+    "battle.BattleClonePersistenceMixin",
+    "battle.BattleCloneNoDeathDropsMixin",
+    "battle.RaidBossAttributeResetMixin",
+    "battle.RaidBattleSelectActionsMixin",
+    "battle.SwitchBroadcastOfflinePlayerMixin",
+    "battle.RaidMoveActionResponseMixin",
+    "battle.RaidPokemonBattleMixin",
+    "battle.RaidPlayerBattleActorMixin",
+    "battle.RaidActiveBattlePokemonMixin",
+    "battle.RaidBattleMessagePnxMixin"
+  ],
+  "client": [
+    "client.RaidBossNameplateIconMixin",
+    "client.BattleOverlayBoonIconMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

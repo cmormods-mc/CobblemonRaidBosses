@@ -1,0 +1,89 @@
+plugins {
+    id 'fabric-loom' version '1.13.6'
+    id 'maven-publish'
+}
+
+version = '0.8.162-admin-helper'
+group = 'com.cobbleraids'
+
+base {
+    archivesName = 'CobbleRaids'
+}
+
+repositories {
+    maven { url = 'https://maven.fabricmc.net/' }
+    mavenCentral()
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = 'Modrinth'
+                url = 'https://api.modrinth.com/maven'
+            }
+        }
+        filter { includeGroup 'maven.modrinth' }
+    }
+}
+
+dependencies {
+    minecraft 'com.mojang:minecraft:1.21.1'
+    mappings loom.officialMojangMappings()
+
+    modImplementation 'net.fabricmc:fabric-loader:0.17.2'
+    modImplementation 'net.fabricmc.fabric-api:fabric-api:0.116.6+1.21.1'
+
+    // Exact public releases used by the live-tested runtime builds.
+    modImplementation 'maven.modrinth:MdwFAVRL:gBW3vLC7' // Cobblemon 1.8.1
+    modImplementation 'maven.modrinth:eTmjDQ2A:azTJ3S8C' // SkiesGUIs 1.8.1
+    // Compile-only: the %cobbleraids:points% token is published when this is installed and
+    // skipped when it is not, so it must never be pulled in as a hard dependency.
+    modCompileOnly 'maven.modrinth:eXts2L7r:U5bhVym2' // Text Placeholder API 2.4.2+1.21
+
+    compileOnly 'org.jetbrains.kotlin:kotlin-stdlib:2.2.20'
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+/**
+ * Covers the parts of CobbleRaids that are deliberately free of Minecraft, Cobblemon and Fabric
+ * types -- spawn-rate maths, contribution maths, config validation, and the Showdown file patcher.
+ * Those are also where a regression is silent rather than loud: a mispatched simulator produces
+ * invulnerable bosses with a clean log, and a spawn-weight change produces a wrong rate nobody can
+ * see. Verifying them here takes a second instead of a jar build plus a modded server boot.
+ */
+tasks.named('test', Test) {
+    useJUnitPlatform()
+    testLogging {
+        events 'failed'
+        exceptionFormat = 'full'
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    withSourcesJar()
+}
+
+processResources {
+    // Read at configuration time: touching `project` inside filesMatching runs during execution,
+    // which Gradle deprecates and the configuration cache forbids.
+    def modVersion = project.version
+    inputs.property 'version', modVersion
+    filesMatching('fabric.mod.json') {
+        expand version: modVersion
+    }
+}
+
+// Consumed by CobbleTowers through `gradlew publishToMavenLocal`. The java component carries the
+// remapped jar and the sources jar; the reward loot tables ship inside the core jar.
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            artifactId = 'cobbleraids'
+            from components.java
+        }
+    }
+}

@@ -1,0 +1,132 @@
+name: Fabric Loom Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history, not the default shallow clone: validate_reward_gui_defaults.py walks the
+          # bundled reward GUI resource's entire git log to check it against RewardGuiDefaults, and
+          # a shallow clone would silently make that check see only the latest commit.
+          fetch-depth: 0
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Validate core source and resources
+        run: validation/validate_core_sources.sh
+
+      - name: Validate raid boss lifecycle and healing integrity
+        run: python3 validation/validate_raid_integrity.py
+
+      - name: Validate reward visibility and SkiesGUIs optionality
+        run: python3 validation/validate_reward_visibility.py
+
+      - name: Validate native reward reveal screen
+        run: python3 validation/validate_reveal_screen.py
+
+      - name: Validate cinematic reveal
+        run: python3 validation/validate_cinematic_reveal.py
+
+      - name: Validate textured reward panel
+        run: python3 validation/validate_reward_panel_textures.py
+
+      - name: Validate real texture art
+        run: python3 validation/validate_reward_texture_art.py
+
+      - name: Validate logging discipline
+        run: python3 validation/validate_logging.py
+
+      - name: Validate Showdown JS syntax
+        run: python3 validation/validate_showdown_js_syntax.py
+
+      - name: Validate raid banned-move list against Cobblemon's real Showdown fork
+        run: python3 validation/validate_raid_banned_moves.py
+
+      - name: Validate reward GUI superseded-default hashes against git history
+        run: python3 validation/validate_reward_gui_defaults.py
+
+      - name: Validate callback fault barriers
+        run: python3 validation/validate_callback_guards.py
+
+      - name: Validate shop species icons
+        # No cobblemon-cards jar in CI, so this checks the committed manifest against the raid roster.
+        run: python3 validation/sprites/build_icon_manifest.py --check
+
+      - name: Validate reward-economy manifest
+        run: python3 validation/economy/validate_economy_manifest.py
+
+      - name: Validate generated reward tables
+        run: python3 validation/economy/build_tables.py --check
+
+      - name: Validate exact reward probabilities
+        run: python3 validation/economy/validate_economy_probabilities.py
+
+      - name: Validate the shop test catalogue
+        run: python3 validation/shop/build_test_catalog.py --check
+
+      - name: Compile and remap
+        run: gradle --no-daemon clean build --stacktrace --warning-mode all
+
+      # After the build on purpose: this reads compiled bytecode, so there is nothing to inspect
+      # until the classes exist. `clean` above also wipes anything a previous run left behind.
+      - name: Validate mixin fault barriers
+        run: python3 validation/validate_mixin_guards.py
+
+      - name: Validate mixin targets are not shadowed
+        run: python3 validation/validate_mixin_target_shadowing.py
+
+      - name: Validate raid-patch.js behaviour against Cobblemon's real Showdown fork
+        run: python3 validation/validate_showdown_raid_patch_behavior.py
+
+      - name: Fuzz the raid battle model on the real Showdown fork
+        run: python3 validation/validate_showdown_fuzz.py
+
+      - name: Validate public API boundary
+        run: python3 validation/validate_api_boundary.py
+
+      - name: Validate runtime JAR
+        # Derived from build.gradle so a version bump cannot silently skip JAR validation.
+        run: |
+          version=$(sed -n "s/^version = '\(.*\)'$/\1/p" build.gradle)
+          jar="build/libs/CobbleRaids-${version}.jar"
+          test -f "$jar" || { echo "missing $jar"; ls -la build/libs; exit 1; }
+          python3 validation/validate_core_sources.py "$jar"
+          python3 validation/validate_raid_integrity.py "$jar"
+          python3 validation/validate_reward_visibility.py "$jar"
+          python3 validation/validate_reveal_screen.py "$jar"
+          python3 validation/validate_cinematic_reveal.py "$jar"
+          python3 validation/validate_reward_panel_textures.py "$jar"
+          python3 validation/validate_reward_texture_art.py "$jar"
+          python3 validation/validate_mixin_guards.py "$jar"
+          python3 validation/validate_api_boundary.py "$jar"
+
+      - name: Upload build outputs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cobbleraids-build
+          path: |
+            build/libs/*.jar
+            build/reports/**
+          if-no-files-found: warn

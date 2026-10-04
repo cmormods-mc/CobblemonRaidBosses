@@ -1,0 +1,505 @@
+package com.cobbleraids.lifecycle;
+
+import com.cobbleraids.api.encounter.EncounterPolicy;
+import com.cobbleraids.api.encounter.LeaveReason;
+import com.cobbleraids.encounter.EncounterService;
+import com.cobbleraids.fault.RaidFaultBarrier;
+import com.cobbleraids.fault.RaidThreadGuard;
+import com.cobbleraids.catching.BossSnapshotService;
+import com.cobbleraids.catching.HallOfLegends;
+import com.cobbleraids.catching.HallOfLegendsAnnouncementService;
+import com.cobbleraids.catching.LegendEntry;
+import com.cobbleraids.catching.RaidCaptureSessionService;
+import com.cobbleraids.catching.RaidPlayerRecords;
+import com.cobbleraids.stats.RaidStats;
+import com.cobbleraids.catching.TrophyLedger;
+import com.cobbleraids.config.CobbleRaidsConfig;
+import com.cobbleraids.config.CobbleRaidsConfigManager;
+import com.cobbleraids.config.RaidDefinition;
+import com.cobbleraids.config.RaidDefinitionRegistry;
+import com.cobbleraids.raid.RaidRegistry;
+import com.cobbleraids.renown.RenownBoon;
+import com.cobbleraids.reward.ContributionMath;
+import com.cobbleraids.raid.RaidSession;
+import com.cobbleraids.spawn.RaidBossEntityMarker;
+import com.cobbleraids.spawn.RaidSpawnScheduler;
+import com.cobbleraids.title.TitleService;
+import com.cobblemon.mod.common.api.battles.model.PokemonBattle;
+import com.cobblemon.mod.common.api.battles.model.actor.BattleActor;
+import com.cobblemon.mod.common.net.messages.client.battle.BattleEndPacket;
+import com.cobblemon.mod.common.pokemon.Pokemon;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import net.minecraft.ChatFormatting;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+
+/** Single authority for raid terminal transitions, cleanup, withdrawal, and reward finalization. */
+public final class RaidLifecycleCoordinator {
+    private static final RaidFinalizationGuard FINALIZATION = new RaidFinalizationGuard();
+    private static final Set<UUID> VICTORY_REQUESTED = ConcurrentHashMap.newKeySet();
+    private RaidLifecycleCoordinator() {}
+
+    /** Called after RaidSession reaches COMPLETED. */
+    public static void requestVictory(RaidSession raid) {
+        if (raid == null || raid.getStatus() != RaidSession.Status.COMPLETED) return;
+        if (!VICTORY_REQUESTED.add(raid.getId())) return;
+        PokemonBattle battle = raid.getBattle();
+        String winners = raid.getActiveParticipants().stream()
+                .map(UUID::toString)
+                .collect(Collectors.joining("&"));
+        if (!winners.isEmpty() && !battle.getEnded()) {
+            // >raidwin is raid-only Showdown INPUT. Our patch converts it to ordinary
+            // |win|UUID&UUID... OUTPUT, which Cobblemon's stock WinInstruction handles.
+            battle.writeShowdownAction(">raidwin " + winners);
+        }
+    }
+
+    public static void onBattleVictory(com.cobblemon.mod.common.api.events.battles.BattleVictoryEvent event) {
+        PokemonBattle battle = event.getBattle();
+        RaidSession raid = RaidRegistry.get(battle);
+        if (raid == null) return;
+
+        if (raid.getStatus() == RaidSession.Status.COMPLETED && raid.getOutcome() == RaidOutcome.VICTORY) {
+            finalizeVictory(raid);
+            return;
+        }
+        if (raid.getStatus() != RaidSession.Status.ACTIVE) return;
+
+        // Raid Showdown considers all player sides one cooperative team. The boss may win only
+        // after every non-withdrawn player side is exhausted.
+        boolean bossWon = event.getWinners().stream().anyMatch(actor -> raid.getBossActorId().equals(actor.getUuid()));
+        if (bossWon) {
+            if (raid.fail()) finalizeAfterBattleEnded(raid);
+            return;
+        }
+
+        if (!event.getWinners().isEmpty()) {
+            // The boss's real Pokemon fainted through a mechanism outside the -raiddamage pool
+            // (Perish Song, Destiny Bond, the Perish Body ability, ...) before the pool reached
+            // zero. Cobblemon already declared the players the winners, so honor it as a genuine
+            // victory -- otherwise the raid never finalizes, RaidRewardService never grants a
+            // reward, and any other mod's own "wild Pokemon fainted" hook fires in its place.
+            if (raid.completeViaRealFaint()) finalizeVictory(raid);
+        } else {
+            // Empty winners is a mutual whiteout -- e.g. Perish Song/Perish Body fainting everyone
+            // on the same turn. Nobody defeated the boss, but the battle has genuinely ended, so
+            // finalize as a loss rather than leaving the session (and the battle UI) hanging.
+            if (raid.fail()) finalizeAfterBattleEnded(raid);
+        }
+    }
+
+    /** The raid was lost with these players still in it. Its own barrier: statistics never block a finalize. */
+    private static void recordLoss(RaidSession raid) {
+        RaidFaultBarrier.guard("stats:loss", () -> {
+            var level = raid.getBossEntity() == null ? null : raid.getBossEntity().level();
+            if (level instanceof net.minecraft.server.level.ServerLevel serverLevel) {
+                RaidStats.onLoss(serverLevel.getServer(), raid);
+            }
+        });
+    }
+
+    /** A player left for good, by their own choice or because their connection did not come back. */
+    private static void recordLeft(RaidSession raid, UUID playerId) {
+        RaidFaultBarrier.guard("stats:left", () -> {
+            var level = raid.getBossEntity() == null ? null : raid.getBossEntity().level();
+            if (level instanceof net.minecraft.server.level.ServerLevel serverLevel) {
+                RaidStats.onLeft(serverLevel.getServer(), raid, playerId);
+            }
+        });
+    }
+
+    /** Fallback for a Cobblemon flee event that escaped the explicit raid-forfeit interception. */
+    public static void onPlayerFled(PokemonBattle battle, UUID playerId) {
+        RaidSession raid = RaidRegistry.get(battle);
+        if (raid == null || raid.getStatus() != RaidSession.Status.ACTIVE) return;
+        // Before any finalization below, so an owner hears who left ahead of how it ended. Only when
+        // this call removed them: a player who already withdrew has been reported once.
+        if (raid.removeParticipant(playerId)) {
+            EncounterService.notifyLeft(raid, playerId, LeaveReason.FLED);
+            recordLeft(raid, playerId);
+        }
+        if (raid.failIfNoActiveParticipants()) finalizeNonVictory(raid);
+    }
+
+    /**
+     * Explicit player withdrawal. The Showdown side becomes inert without zeroing the player's
+     * actual BattlePokemon HP; this preserves the legitimate battle state accumulated before leaving.
+     *
+     * Cobblemon's battle registry still owns the actor until the shared battle ends. This is deliberate:
+     * allowing that same party to enter a second battle concurrently would race its BattlePokemon state.
+     */
+    public static boolean withdrawPlayer(RaidSession raid, ServerPlayer player) {
+        if (raid == null || player == null || raid.getStatus() != RaidSession.Status.ACTIVE) return false;
+        UUID playerId = player.getUUID();
+        if (!raid.removeParticipant(playerId)) return false;
+        recordLeft(raid, playerId);
+
+        PokemonBattle battle = raid.getBattle();
+        BattleActor actor = battle.getActor(player);
+        if (actor != null) {
+            actor.getResponses().clear();
+            actor.setRequest(null);
+            actor.setMustChoose(false);
+        }
+
+        player.sendSystemMessage(Component.literal("You withdrew from the raid and forfeited its rewards.")
+                .withStyle(ChatFormatting.YELLOW));
+        // Close this player's battle UI immediately. Future actor updates are suppressed by the
+        // PlayerBattleActor mixin while the shared battle safely retains the actor until final cleanup.
+        new BattleEndPacket().sendToPlayer(player);
+        EncounterService.notifyLeft(raid, playerId, LeaveReason.WITHDREW);
+
+        if (raid.failIfNoActiveParticipants()) {
+            finalizeNonVictory(raid);
+            return true;
+        }
+        if (actor != null && actor.getShowdownId() != null && !battle.getEnded()) {
+            battle.writeShowdownAction(">raidleave " + actor.getShowdownId());
+        }
+        return true;
+    }
+
+    /** Disconnects cannot be rejected, so they are treated as a reward-forfeiting withdrawal. */
+    public static void onPlayerDisconnected(RaidSession raid, UUID playerId) {
+        if (raid == null || playerId == null || raid.getStatus() != RaidSession.Status.ACTIVE) return;
+        if (!raid.removeParticipant(playerId)) return;
+        recordLeft(raid, playerId);
+        PokemonBattle battle = raid.getBattle();
+        BattleActor actor = battle.getActor(playerId);
+        if (actor != null) {
+            actor.getResponses().clear();
+            actor.setRequest(null);
+            actor.setMustChoose(false);
+        }
+        EncounterService.notifyLeft(raid, playerId, LeaveReason.DISCONNECTED);
+        if (raid.failIfNoActiveParticipants()) {
+            finalizeNonVictory(raid);
+            return;
+        }
+        if (actor != null && actor.getShowdownId() != null && !battle.getEnded()) {
+            battle.writeShowdownAction(">raidleave " + actor.getShowdownId());
+        }
+    }
+
+    public static void timeout(RaidSession raid, MinecraftServer server) {
+        if (raid == null || raid.getStatus() != RaidSession.Status.ACTIVE || !raid.fail()) return;
+        for (UUID id : raid.getActiveParticipants()) {
+            ServerPlayer player = server.getPlayerList().getPlayer(id);
+            if (player != null) player.sendSystemMessage(
+                    Component.literal("Time expired. The raid was lost.").withStyle(ChatFormatting.RED));
+        }
+        finalizeNonVictory(raid);
+    }
+
+    public static void onBattleFainted(PokemonBattle battle) {
+        RaidSession raid = RaidRegistry.get(battle);
+        if (raid == null || raid.getStatus() != RaidSession.Status.ACTIVE) return;
+        // A single faint is intentionally non-terminal. Showdown requests replacement normally.
+    }
+
+    /**
+     * Administrative cancellation, not a defeat. It must not record a failed attempt against the
+     * boss, and it must always remove it: RaidAdminBossOps.safelyRemove delegates the whole despawn
+     * to this for a boss that is mid-battle, so leaving the boss standing here would make
+     * /cobbleraids despawn silently do nothing to exactly the bosses an operator most wants gone.
+     */
+    public static void abort(RaidSession raid) {
+        if (raid == null || !raid.abort()) return;
+        finalizeNonVictory(raid, false);
+    }
+
+    /**
+     * Ends every still-live raid before the world saves, so a boss frozen mid-battle is never
+     * written to disk as an ordinary, permanently-invulnerable entity nobody's bookkeeping still
+     * knows about. Registered on SERVER_STOPPING, ahead of the world save -- SERVER_STOPPED's own
+     * handlers (including {@link RaidRegistry#onServerStopped}) only clear in-memory maps and run
+     * too late to stop that write.
+     *
+     * <p>Before this, a raid left active at shutdown (a crash, or simply {@code /stop} mid-fight --
+     * {@link com.cobbleraids.lifecycle.RaidReconnectService#onPlayerDisconnected} turns the
+     * resulting mass disconnect into a harmless grace hold rather than a real finalize now that
+     * reconnect grace exists) relied entirely on {@link com.cobbleraids.spawn.RaidSpawnScheduler}'s
+     * boot-time purge to clean up after the fact -- and that purge only catches natural and owned
+     * bosses in already-loaded chunks, never an admin-spawned one, and never one in a chunk nobody
+     * has walked back into. Ending it here instead means nothing invalid reaches disk in the first
+     * place.
+     */
+    public static void abortAll() {
+        for (RaidSession raid : RaidRegistry.all()) {
+            RaidFaultBarrier.guard("shutdown:abort-raid", () -> abort(raid));
+        }
+    }
+
+    private static void finalizeVictory(RaidSession raid) {
+        RaidThreadGuard.expectServerThread("finalize-victory");
+        RaidCombatRuleService.forget(raid.getId());
+        MinecraftServer server = ((net.minecraft.server.level.ServerLevel) raid.getBossEntity().level()).getServer();
+        // Null for an ordinary raid, which has every side effect exactly as before owned encounters
+        // existed. An owned encounter has only the ones its owner asked for.
+        EncounterPolicy policy = raid.isOwned() ? raid.getOwnership().policy() : null;
+        FINALIZATION.finalizeOnce(raid.getId(), () -> {
+            // Its own barrier, first: a statistic that cannot be recorded must not be the reason a
+            // reward is not paid, and nothing below depends on it having run.
+            RaidFaultBarrier.guard("stats:victory", () -> RaidStats.onVictory(server, raid));
+            // Before the reward screen is queued, so a level-up and its evolution offer reach the
+            // chat ahead of the screen rather than arriving behind it. Victory paths only: a lost,
+            // timed-out or aborted raid pays nothing, exactly as it pays no items.
+            if (policy == null || policy.progression()) RaidProgressionTransfer.grant(raid, server);
+            RaidBattleStateCarryover.apply(raid);
+            // Both need the boss's Pokemon, which the cleanup below is about to discard, and both
+            // read the same per-player history, so they run together and before it.
+            recordAndOfferCatch(raid, server, policy);
+            if (policy == null || policy.raidRewards()) RaidRewardService.grant(RaidRewardEligibility.victory(raid), server);
+        },
+                // Separate steps, so one that throws cannot skip the others; see RaidFinalizationGuard.
+                () -> RaidRegistry.remove(raid.getBattle()),
+                () -> cleanupBossEntity(raid),
+                () -> VICTORY_REQUESTED.remove(raid.getId()),
+                // Last: an owner is told once the battle is closed and the boss is gone.
+                () -> EncounterService.notifyEnded(raid));
+    }
+
+    /**
+     * Credits every victor's raid history, then offers each of them a chance at the boss.
+     *
+     * <p>History is recorded for everyone who stayed, whether or not catching is switched on: the
+     * record is the substrate a catch mechanic is chosen from later, so it has to have been
+     * accumulating before the choice is made, or the feature launches with every player at zero.
+     *
+     * <p>An owned encounter records history and rolls the catch only if its policy says so. The
+     * catch copies the boss and removes its uncatchable flag, so for a boss that must never be
+     * obtainable, skipping the roll is the only thing standing between it and a player's PC. The
+     * personal-shop snapshot (see {@link BossSnapshotService}) is another such obtain-path for the
+     * same boss, so it is gated on the same {@code catchable} policy flag -- independently of
+     * {@code CobbleRaidsConfig.PersonalBossShop.enabled}, its own separate on/off switch.
+     */
+    private static void recordAndOfferCatch(RaidSession raid, MinecraftServer server, EncounterPolicy policy) {
+        boolean history = policy == null || policy.raidHistory();
+        boolean catching = policy == null || policy.catchable();
+        if (!history && !catching) return;
+
+        RaidDefinition definition = RaidDefinitionRegistry.get(raid.getDefinitionId());
+        if (definition == null) return;
+        var boss = raid.getBossEntity();
+        Pokemon bossPokemon = boss == null ? null : boss.getPokemon();
+        Set<UUID> victors = raid.getActiveParticipants();
+        // Same figures the reward screen shows, computed once rather than per player.
+        Map<UUID, Double> contributions =
+                ContributionMath.percentages(raid.getContributionSnapshot(), victors);
+
+        // History first, for every victor, in one persist. Catching reads that history, so it has to
+        // be written before any of the rolls below.
+        if (history) {
+            Map<UUID, Double> earned = new LinkedHashMap<>();
+            for (UUID playerId : victors) earned.put(playerId, contributions.getOrDefault(playerId, 0.0));
+            RaidPlayerRecords.recordWins(server, definition.rarityTier(), definition.id(), earned);
+
+            // A win can cross a RAIDS_WON or TIER_WINS threshold, so titles are checked right after
+            // the record they read moves -- the same reasoning RaidCaptureSessionService checks them
+            // right after recordCatch.
+            for (UUID playerId : victors) {
+                RaidFaultBarrier.guard("title-unlock:win", () -> TitleService.checkUnlocks(server, playerId));
+            }
+
+            // Same history flag as the win record above: the trophy room is raid history, not a
+            // personal-shop or catching feature, so it must not depend on either of those being on.
+            if (bossPokemon != null) {
+                RaidFaultBarrier.guard("trophy-ledger", () -> {
+                    ResourceLocation species = bossPokemon.getSpecies().getResourceIdentifier();
+                    int ivPercent = BossSnapshotService.percentOf(bossPokemon.getIvs().total(), 186);
+                    int evPercent = BossSnapshotService.percentOf(bossPokemon.getEvs().total(), 510);
+                    long now = System.currentTimeMillis();
+                    for (UUID playerId : victors) {
+                        TrophyLedger.recordDefeat(server, playerId, species, bossPokemon.getLevel(),
+                                bossPokemon.getShiny(), ivPercent, evPercent, definition.rarityTier(), now,
+                                raid.getRenownTitle());
+                    }
+                });
+
+                // Same guard, same history flag, but its own fault barrier: a failure recording a
+                // server-wide first must not take the per-player trophy write above down with it.
+                if (!raid.getRenownTitle().isEmpty()) {
+                    RaidFaultBarrier.guard("hall-of-legends", () -> {
+                        ResourceLocation species = bossPokemon.getSpecies().getResourceIdentifier();
+                        RenownBoon boon = RenownBoon.decode(raid.getRenownBoon())
+                                .orElse(new RenownBoon(RenownBoon.Kind.NONE, null));
+                        List<UUID> victorIds = new ArrayList<>(victors.size());
+                        List<String> victorNames = new ArrayList<>(victors.size());
+                        for (UUID playerId : victors) {
+                            ServerPlayer online = server.getPlayerList().getPlayer(playerId);
+                            victorIds.add(playerId);
+                            victorNames.add(online != null ? online.getGameProfile().getName() : playerId.toString());
+                        }
+                        LegendEntry candidate = new LegendEntry(raid.getRenownTitle(), species,
+                                definition.rarityTier(), boon, System.currentTimeMillis(), victorIds, victorNames);
+                        if (HallOfLegends.recordFirstDefeat(server, candidate)) {
+                            HallOfLegendsAnnouncementService.announce(server, candidate);
+                        }
+                    });
+                }
+            }
+        }
+
+        if (!catching) return;
+        boolean personalShop = bossPokemon != null && CobbleRaidsConfigManager.get().personalBossShop().enabled();
+        if (personalShop) {
+            for (UUID playerId : victors) {
+                ServerPlayer player = server.getPlayerList().getPlayer(playerId);
+                if (player == null) continue;
+                RaidFaultBarrier.guard("boss-snapshot", () ->
+                        BossSnapshotService.snapshot(server, playerId, definition.rarityTier(), bossPokemon));
+            }
+        }
+        if (bossPokemon == null) return;
+        // Offered regardless of online status, unlike the personal-shop snapshot above: a player
+        // mid-reconnect-grace can still be an active participant, and their choice window (once they
+        // actually claim) is wall clock, so there is no reason to require them online at this exact
+        // instant to be offered a session.
+        RaidCaptureSessionService.offer(server, definition, bossPokemon, raid.getId(), victors);
+    }
+
+    /** Used when Cobblemon/Showdown already ended the battle and then emitted BATTLE_VICTORY. */
+    private static void finalizeAfterBattleEnded(RaidSession raid) {
+        RaidCombatRuleService.forget(raid.getId());
+        FINALIZATION.finalizeOnce(raid.getId(),
+                // The ordinary way a raid is lost -- the boss wins in Showdown -- so this is where most
+                // losses are recorded; finalizeNonVictory below only sees timeouts and withdrawals.
+                () -> {
+                    recordLoss(raid);
+                    RaidBattleStateCarryover.apply(raid);
+                },
+                // Separate steps, so one that throws cannot skip the others; see RaidFinalizationGuard.
+                () -> RaidRegistry.remove(raid.getBattle()),
+                () -> releaseBossAfterFailure(raid),
+                () -> VICTORY_REQUESTED.remove(raid.getId()),
+                () -> EncounterService.notifyEnded(raid));
+    }
+
+    /** Every ordinary way a raid is lost: the players failed, so the boss records the attempt. */
+    private static void finalizeNonVictory(RaidSession raid) {
+        finalizeNonVictory(raid, true);
+    }
+
+    /** Used for timeout/flee/abort paths where no normal Showdown win packet is guaranteed. */
+    private static void finalizeNonVictory(RaidSession raid, boolean countsAsFailedAttempt) {
+        RaidCombatRuleService.forget(raid.getId());
+        PokemonBattle battle = raid.getBattle();
+        FINALIZATION.finalizeOnce(raid.getId(),
+                // Read the clones before end(), which retires the actors this walks.
+                () -> {
+                    // An administrative abort is not a loss: it counts for nobody, like it costs the boss
+                    // no failed attempt. Recorded before the actors are retired, while the participants
+                    // who were still in the raid can be told apart from those who left.
+                    if (countsAsFailedAttempt) recordLoss(raid);
+                    RaidBattleStateCarryover.apply(raid);
+                },
+                // Ending the battle is cleanup, not a side effect: skipping it strands Cobblemon's
+                // actors and leaves every player sitting in a battle UI they cannot leave.
+                // PokemonBattle.end() sends BattleEndPacket, lets entity-backed actors clear
+                // battleId, and calls BattleRegistry.closeBattle(this) -- so it runs before
+                // RaidRegistry.remove. Each step is separate: if end() throws, the registry entry
+                // and the boss are still released, since a battle that failed to end is not one
+                // this raid can resume.
+                () -> { if (!battle.getEnded()) battle.end(); },
+                () -> RaidRegistry.remove(battle),
+                () -> { if (countsAsFailedAttempt) releaseBossAfterFailure(raid); else cleanupBossEntity(raid); },
+                () -> VICTORY_REQUESTED.remove(raid.getId()),
+                () -> EncounterService.notifyEnded(raid));
+    }
+
+    /**
+     * A raid that ended in defeat leaves the boss standing for another attempt, until it has beaten
+     * enough parties. Before this, every terminal path discarded the boss, so any loss consumed it
+     * and there was effectively one attempt per boss no matter what.
+     *
+     * <p>The count lives on the entity ({@link RaidBossEntityMarker#recordFailedAttempt}), so it
+     * has the boss's own lifetime and needs no cleanup anywhere. A surviving boss is deliberately
+     * NOT forgotten by the scheduler: it still holds its raid slot, and its unattended-despawn and
+     * total-lifetime timers keep running, so a boss nobody can beat still leaves on schedule.
+     *
+     * <p>The boss is fully healed between attempts. Its Pokemon is the real entity's, not a clone,
+     * so the damage from the failed raid is really on it, and a second party would otherwise walk
+     * into a boss at whatever HP the last one left -- while the raid's own health pool restarts at
+     * full, making the bar disagree with the entity.
+     *
+     * <p>An owned encounter's boss is always removed instead: nobody else can fight it, and its
+     * owner decides whether there is a next attempt.
+     */
+    private static void releaseBossAfterFailure(RaidSession raid) {
+        var boss = raid.getBossEntity();
+        if (raid.isOwned() || boss == null || boss.isRemoved()) {
+            cleanupBossEntity(raid);
+            return;
+        }
+
+        int attempts = RaidBossEntityMarker.recordFailedAttempt(boss);
+        CobbleRaidsConfig.CombatDefaults combat = CobbleRaidsConfigManager.get().combatDefaults();
+        boolean spent = combat.attemptsAreLimited() && attempts >= combat.maxFailedAttempts();
+
+        MinecraftServer server = ((ServerLevel) boss.level()).getServer();
+        if (spent) {
+            announce(server, raid, Component.literal("The raid boss has driven off enough challengers and departs.")
+                    .withStyle(ChatFormatting.RED));
+            cleanupBossEntity(raid);
+            return;
+        }
+
+        boss.getPokemon().heal();
+        if (combat.attemptsAreLimited()) {
+            int left = combat.maxFailedAttempts() - attempts;
+            announce(server, raid, Component.literal("The raid boss remains. "
+                    + left + " more failed attempt" + (left == 1 ? "" : "s") + " and it will depart.")
+                    .withStyle(ChatFormatting.YELLOW));
+        }
+    }
+
+    /** Everyone still in the battle, including players who withdrew, since they were all there. */
+    private static void announce(MinecraftServer server, RaidSession raid, Component message) {
+        if (server == null) return;
+        for (UUID id : raid.getParticipants()) {
+            ServerPlayer player = server.getPlayerList().getPlayer(id);
+            if (player != null) player.sendSystemMessage(message);
+        }
+    }
+
+    /**
+     * Every terminal path ends here, so this is the single place that hands a natural boss's raid
+     * slot back to the scheduler. RaidSpawnScheduler.onEntityUnloaded would also catch the discard
+     * below, but only while the boss is in a loaded chunk; forgetting it explicitly makes the
+     * release a property of the raid ending rather than of Minecraft's entity-removal plumbing, and
+     * covers the case where the entity is already gone and discard() is skipped. Forgetting a UUID
+     * the scheduler never tracked (an admin-spawned boss) is a no-op.
+     */
+    private static void cleanupBossEntity(RaidSession raid) {
+        var boss = raid.getBossEntity();
+        if (boss != null) RaidSpawnScheduler.forget(boss.getUUID());
+        if (boss != null && !boss.isRemoved()) boss.discard();
+    }
+
+    /**
+     * Raids currently mid-finalization. Outside a finalization call this must be zero: a claim that
+     * outlives its call is the leak that stranded raids before RaidFinalizationGuard existed.
+     */
+    public static int finalizationsInFlight() { return FINALIZATION.size(); }
+
+    /**
+     * Both guards are released per raid inside the must-run cleanup of every terminal path, so
+     * neither grows with the number of raids played. This covers the remaining case: a server that
+     * stops with raids still in flight never reaches a terminal path at all, and an integrated
+     * (single-player) client reuses this JVM for every world it opens.
+     */
+    public static void onServerStopped() {
+        FINALIZATION.clear();
+        VICTORY_REQUESTED.clear();
+    }
+}

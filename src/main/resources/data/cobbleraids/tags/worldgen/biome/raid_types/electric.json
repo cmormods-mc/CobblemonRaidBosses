@@ -1,0 +1,10 @@
+{
+  "replace": false,
+  "values": [
+    "minecraft:windswept_hills",
+    "minecraft:stony_peaks",
+    "#c:is_windswept",
+    "#minecraft:is_mountain",
+    "#c:is_mountain"
+  ]
+}

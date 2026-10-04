@@ -1,0 +1,755 @@
+'use strict';
+
+const {Battle} = require('./sim/battle');
+const {BattleActions} = require('./sim/battle-actions');
+const {Side} = require('./sim/side');
+const {Pokemon} = require('./sim/pokemon');
+
+/**
+ * Dynamic cooperative raid topology.
+ *
+ * The Java bridge supplies format.playerCount = joinedPlayers + 1.
+ * The LAST Showdown side is always the raid boss; every earlier side is a player.
+ * This keeps 1..N recruitment independent from fixed p1-p5 assumptions.
+ */
+const isRaid = value => {
+  const battle = value?.battle || value;
+  return !!battle && battle.gameType === 'raid';
+};
+const bossIndex = battle => battle.sides.length - 1;
+const bossSide = battle => battle.sides[bossIndex(battle)] || null;
+const isBossSide = side => isRaid(side?.battle) && side.n === bossIndex(side.battle);
+const isPlayerSide = side => isRaid(side?.battle) && side.n >= 0 && side.n < bossIndex(side.battle);
+const isEliminatedPlayerSide = side => isPlayerSide(side) && (
+  side.pokemonLeft <= 0 ||
+  (side.pokemon.length > 0 && side.pokemon.every(pokemon => !pokemon || pokemon.fainted || pokemon.hp <= 0))
+);
+const isActivePlayerSide = side => isPlayerSide(side) && !side.raidWithdrawn && !isEliminatedPlayerSide(side);
+
+// raidboss.onDamage must return numeric 0 so Showdown keeps the hit successful and
+// continues secondary effects and turn resolution. Showdown nevertheless follows a
+// zero-damage result with a vanilla `-damage ... 100/100` instruction. Suppress only
+// that marked boss instruction; the preceding `-raiddamage` remains authoritative.
+const oldAdd = Battle.prototype.add;
+Battle.prototype.add = function(...parts) {
+  const target = parts[1];
+  if (isRaid(this) && isBossSide(target?.side)) {
+    if (parts[0] === '-damage' && target.__cobbleRaidsSuppressVanillaDamageLog) {
+      delete target.__cobbleRaidsSuppressVanillaDamageLog;
+      return;
+    }
+    // Every vanilla -heal line about the boss carries the pinned simulator health
+    // string (100/100 while the raid pool may be nearly empty) and would overwrite
+    // the shared raid bar on every client. -raidheal below is the authoritative one.
+    if (parts[0] === '-heal') return;
+  }
+  return oldAdd.apply(this, parts);
+};
+
+/**
+ * Raid boss healing.
+ *
+ * Damage against the boss is reported through -raiddamage and then swallowed, so
+ * the simulator keeps the boss pinned at full HP while the authoritative pool
+ * lives in Java (RaidSession). Healing has to travel the same road, and it did
+ * not: Showdown decides whether a heal is allowed by reading simulator HP, which
+ * for the boss always says "already at full". Three vanilla checks refuse the
+ * heal outright — BattleActions#runMoveEffects for moves with a `heal:` property
+ * (Recover, Roost, Slack Off, Milk Drink, Soft-Boiled, Heal Order, Life Dew),
+ * Battle#heal for everything routed through it (drain, Leftovers, Aqua Ring,
+ * terrain, Rest), and per-move `hp === maxhp` guards (Rest, Swallow, Synthesis,
+ * Morning Sun, Moonlight, Shore Up). Each logs `-fail <boss> heal`, which
+ * Cobblemon renders as "<boss>'s HP is full!", and the boss wastes the turn.
+ *
+ * Worse, when the boss does enter a battle below full simulator HP — a wild boss
+ * whose entity health was written down by an earlier raid — the `heal:` path
+ * silently succeeded and emitted a vanilla -heal, pushing every client's raid bar
+ * to 100% without the Java pool ever hearing about it.
+ *
+ * The three hooks below convert boss healing into -raidheal, which the Java
+ * RaidHealInstruction applies to the pool (clamped to the pool maximum) before
+ * pushing the true percentage back to clients:
+ *   - Battle#heal    handles residual and effect-driven healing.
+ *   - Pokemon#heal   handles the direct call runMoveEffects makes for `heal:` moves.
+ *   - runMove        lends the boss one point of simulated headroom for the
+ *                    duration of a move so the `hp === maxhp` guards stop firing.
+ * Healing is applied in the same currency as damage: one simulated HP restores one
+ * point of the raid pool, so a Recover undoes roughly one attack rather than half
+ * of a multi-player health bar.
+ */
+const reportRaidHeal = (battle, target, amount) => {
+  const healed = battle.trunc(amount);
+  if (!healed || isNaN(healed) || healed <= 0) return 0;
+  battle.add('-raidheal', target, healed);
+  return healed;
+};
+
+const oldBattleHeal = Battle.prototype.heal;
+Battle.prototype.heal = function(damage, target = null, source = null, effect = null) {
+  if (this.event) {
+    if (!target) target = this.event.target;
+    if (!source) source = this.event.source;
+    if (!effect) effect = this.effect;
+  }
+  if (!isRaid(this) || !isBossSide(target?.side)) {
+    return oldBattleHeal.call(this, damage, target, source, effect);
+  }
+  if (effect === 'drain') effect = this.dex.conditions.getByID(effect);
+  if (damage && damage <= 1) damage = 1;
+  damage = this.trunc(damage);
+  damage = this.runEvent('TryHeal', target, source, effect, damage);
+  if (!damage) return damage;
+  if (!target.hp) return false;
+  if (!target.isActive) return false;
+  // Deliberately no `target.hp >= target.maxhp` guard: simulated boss HP is pinned,
+  // so RaidSession#heal is the only thing that can decide there is nothing to heal.
+  return reportRaidHeal(this, target, damage);
+};
+
+const oldPokemonHeal = Pokemon.prototype.heal;
+Pokemon.prototype.heal = function(d, source = null, effect = null) {
+  if (!isRaid(this.side) || !isBossSide(this.side)) {
+    return oldPokemonHeal.call(this, d, source, effect);
+  }
+  if (!this.hp) return false;
+  d = this.battle.trunc(d);
+  if (isNaN(d) || d <= 0) return false;
+  // Simulator HP stays pinned; the pool is the real health, so report and move on.
+  return reportRaidHeal(this.battle, this, d);
+};
+
+const RAID_BOSS_HEAL_HEADROOM = 1;
+const lendRaidBossHealHeadroom = battle => {
+  const boss = bossSide(battle);
+  const lent = [];
+  if (!boss) return lent;
+  for (const pokemon of boss.active) {
+    if (!pokemon || pokemon.fainted || pokemon.hp <= 0 || pokemon.hp < pokemon.maxhp) continue;
+    if (pokemon.maxhp <= RAID_BOSS_HEAL_HEADROOM) continue;
+    pokemon.hp = pokemon.maxhp - RAID_BOSS_HEAL_HEADROOM;
+    lent.push(pokemon);
+  }
+  return lent;
+};
+const repinRaidBoss = lent => {
+  for (const pokemon of lent) if (!pokemon.fainted) pokemon.hp = pokemon.maxhp;
+};
+
+const oldRunMove = BattleActions.prototype.runMove;
+BattleActions.prototype.runMove = function(...args) {
+  if (!isRaid(this.battle)) return oldRunMove.apply(this, args);
+  const lent = lendRaidBossHealHeadroom(this.battle);
+  try {
+    return oldRunMove.apply(this, args);
+  } finally {
+    // Also re-pins after any effect that writes boss HP directly and bypasses the
+    // Damage event entirely (Curse, Belly Drum, Substitute, Pain Split).
+    repinRaidBoss(lent);
+  }
+};
+
+function refreshOpponentAnchors(battle) {
+  if (!isRaid(battle)) return;
+  const boss = bossSide(battle);
+  const players = battle.sides.filter(isPlayerSide);
+  const activePlayers = players.filter(isActivePlayerSide);
+  for (const player of players) {
+    player.foe = boss;
+    player.allySide = null;
+  }
+  if (boss) {
+    // A few upstream mechanics still dereference side.foe directly instead of calling foes().
+    // Keep a live player anchor while the raid-specific foes() override supplies the full group.
+    boss.foe = activePlayers[0] || players[0] || null;
+    boss.allySide = null;
+  }
+}
+
+function passivatePlayerSide(side) {
+  // A withdrawn player's forced switch still has to be answered or the shared turn can never move on:
+  // every other side is waiting for it, the withdrawn side can no longer answer, and neither resuming
+  // nor leaving re-asks. Found by validation/showdown_fuzz.js -- a held player whose Pokemon fainted
+  // froze the whole raid. Their next Pokemon is chosen for them (the same implicit pick a forced
+  // "default" gets) and the choice is KEPT, which clearChoice() below would otherwise throw away.
+  if (side.requestState === 'switch' && !isEliminatedPlayerSide(side) && !side.isChoiceDone()) {
+    try {
+      side.autoChoose();
+    } catch (err) {
+      side.battle.add('-message', `${side.name}'s forced switch could not be resolved: ${err && err.message}`);
+    }
+    const wait = {wait: true, side: side.getRequestData()};
+    if (!side.activeRequest?.wait) side.emitRequest(wait);
+    else side.activeRequest = wait;
+    return;
+  }
+  const request = {wait: true, side: side.getRequestData()};
+  if (!side.activeRequest?.wait) side.emitRequest(request);
+  else side.activeRequest = request;
+  side.clearChoice();
+}
+
+function raidNormalizeSide(side) {
+  if (isRaid(side)) side.id = `p${side.n + 1}`;
+  return side;
+}
+
+/**
+ * Forced switches answered with "default" deadlock the raid.
+ *
+ * Cobblemon turns a DEFAULT action into ">pN default", which Showdown's Side#choose routes to
+ * autoChoose() -> chooseSwitch() with no argument. chooseSwitch then computes an implicit slot and
+ * falls into `if (isNaN(slot) || slot < 0 || slotText.length > 2)` (side.js:611) -- and slotText is
+ * undefined on that path, so it throws TypeError instead of switching. The side's choice is left
+ * incomplete, allChoicesDone() never becomes true, and the turn never commits: the raid hangs on the
+ * first player Pokemon to faint, which in a raid is a matter of seconds.
+ *
+ * Rather than reimplement the 60-line chooser, resolve only the implicit slot -- exactly as stock
+ * does directly above the throwing line -- and hand that concrete slot straight back to stock, so
+ * every validation, error message and side effect after it stays upstream's. Scoped to raids, so
+ * ordinary Cobblemon battles keep stock behaviour untouched.
+ */
+const oldChooseSwitch = Side.prototype.chooseSwitch;
+Side.prototype.chooseSwitch = function(slotText) {
+  if (slotText !== undefined || !isRaid(this) || this.requestState !== 'switch') {
+    return oldChooseSwitch.call(this, slotText);
+  }
+  const index = this.getChoiceIndex();
+  // Out of range is stock's own "more switches than Pokemon that need to switch" error, and it
+  // returns before the throwing line, so let stock report it.
+  if (index >= this.active.length) return oldChooseSwitch.call(this, slotText);
+
+  const pokemon = this.active[index];
+  let slot;
+  if (this.slotConditions[pokemon.position]['revivalblessing']) {
+    slot = 0;
+    while (slot < this.pokemon.length && !this.pokemon[slot].fainted) slot++;
+  } else {
+    if (!this.choice.forcedSwitchesLeft) return this.choosePass();
+    slot = this.active.length;
+    while (slot < this.pokemon.length && (this.choice.switchIns.has(slot) || this.pokemon[slot].fainted)) slot++;
+  }
+  // Nothing left to send in. Stock walks off the end of the array here; passing is the same
+  // resolution it already uses when there is no forced switch to make, and it keeps the turn moving.
+  if (slot >= this.pokemon.length) return this.choosePass();
+  return oldChooseSwitch.call(this, String(slot + 1));
+};
+
+const oldAllies = Side.prototype.allies;
+Side.prototype.allies = function(all) {
+  if (!isRaid(this)) return oldAllies.call(this, all);
+  if (isBossSide(this)) return this.active.filter(p => p && (all || p.hp));
+  const result = [];
+  for (const side of this.battle.sides) {
+    if (!isActivePlayerSide(side)) continue;
+    for (const p of side.active) if (p) result.push(p);
+  }
+  return all ? result : result.filter(p => p.hp);
+};
+
+const oldFoes = Side.prototype.foes;
+Side.prototype.foes = function(all) {
+  if (!isRaid(this)) return oldFoes.call(this, all);
+  if (isBossSide(this)) {
+    const result = [];
+    for (const side of this.battle.sides) {
+      if (!isActivePlayerSide(side)) continue;
+      for (const p of side.active) if (p) result.push(p);
+    }
+    return all ? result : result.filter(p => p.hp);
+  }
+  const boss = bossSide(this.battle);
+  return boss ? boss.active.filter(p => p && (all || p.hp)) : [];
+};
+
+const oldHasAlly = Side.prototype.hasAlly;
+Side.prototype.hasAlly = function(pokemon) {
+  if (!isRaid(this)) return oldHasAlly.call(this, pokemon);
+  if (!pokemon) return false;
+  if (isBossSide(this)) return isBossSide(pokemon.side);
+  return isActivePlayerSide(pokemon.side);
+};
+
+const oldFoePokemonLeft = Side.prototype.foePokemonLeft;
+Side.prototype.foePokemonLeft = function() {
+  if (!isRaid(this)) return oldFoePokemonLeft.call(this);
+  if (isBossSide(this)) {
+    return this.battle.sides.slice(0, bossIndex(this.battle)).reduce((n, side) => n + (isActivePlayerSide(side) ? side.pokemonLeft : 0), 0);
+  }
+  return bossSide(this.battle)?.pokemonLeft || 0;
+};
+
+const oldActiveTeam = Side.prototype.activeTeam;
+Side.prototype.activeTeam = function() {
+  if (!isRaid(this)) return oldActiveTeam.call(this);
+  return this.allies(true);
+};
+
+// Cobblemon's Java battle model keeps all human raid actors on one BattleSide.
+// Their active PNX slot letters therefore advance across the human side (p1a, p2b,
+// p3c, p4d), while the lone boss on the opposite Java side is always <bossId>a.
+// Stock Showdown derives letters from half-field numbering (p1a, p2a, p3b...),
+// which is incompatible with Cobblemon's getActorAndActiveSlotFromPNX decoder.
+const oldGetSlot = Pokemon.prototype.getSlot;
+Pokemon.prototype.getSlot = function() {
+  if (!isRaid(this.side)) return oldGetSlot.call(this);
+  if (isBossSide(this.side)) return `${this.side.id}a`;
+  const letter = 'abcdef'.charAt(this.side.n);
+  if (!letter) throw new Error(`CobbleRaids PNX supports at most 6 human raid sides; got side index ${this.side.n}`);
+  return `${this.side.id}${letter}`;
+};
+
+const oldPokemonIsAlly = Pokemon.prototype.isAlly;
+Pokemon.prototype.isAlly = function(pokemon) {
+  if (!isRaid(this.side)) return oldPokemonIsAlly.call(this, pokemon);
+  return !!pokemon && this.side.hasAlly(pokemon);
+};
+
+const oldAdjacentAllies = Pokemon.prototype.adjacentAllies;
+Pokemon.prototype.adjacentAllies = function() {
+  if (!isRaid(this.side)) return oldAdjacentAllies.call(this);
+  return this.allies().filter(p => p !== this && !p.fainted);
+};
+
+const oldAdjacentFoes = Pokemon.prototype.adjacentFoes;
+Pokemon.prototype.adjacentFoes = function() {
+  if (!isRaid(this.side)) return oldAdjacentFoes.call(this);
+  return this.foes().filter(p => !p.fainted);
+};
+
+// +1 always means the boss from a player side. Negative values identify allied player sides.
+const oldGetLocOf = Pokemon.prototype.getLocOf;
+Pokemon.prototype.getLocOf = function(target) {
+  if (!isRaid(this.side)) return oldGetLocOf.call(this, target);
+  if (isBossSide(target.side)) return 1;
+  if (target.side.n === this.side.n) return -1;
+  return -(target.side.n + 2);
+};
+
+const oldGetAtLoc = Pokemon.prototype.getAtLoc;
+Pokemon.prototype.getAtLoc = function(targetLoc) {
+  if (!isRaid(this.side)) return oldGetAtLoc.call(this, targetLoc);
+  if (targetLoc === 1) return bossSide(this.battle)?.active[0] || null;
+  if (targetLoc < -1) {
+    const sideIndex = -targetLoc - 2;
+    const side = this.battle.sides[sideIndex];
+    return isActivePlayerSide(side) ? side?.active[0] || null : null;
+  }
+  return this;
+};
+
+const oldValidTargetLoc = Battle.prototype.validTargetLoc;
+Battle.prototype.validTargetLoc = function(targetLoc, source, targetType) {
+  if (!isRaid(this)) return oldValidTargetLoc.call(this, targetLoc, source, targetType);
+  if (!targetLoc) return true;
+  const target = source.getAtLoc(targetLoc);
+  if (!target || target.fainted) return false;
+  if (targetType === 'adjacentAlly' || targetType === 'adjacentAllyOrSelf' || targetType === 'allySide' || targetType === 'allyTeam') {
+    return source.isAlly(target);
+  }
+  if (targetType === 'adjacentFoe' || targetType === 'normal' || targetType === 'randomNormal' || targetType === 'any' || targetType === 'scripted') {
+    return !source.isAlly(target) || target === source;
+  }
+  return true;
+};
+
+const oldGetRandomTarget = Battle.prototype.getRandomTarget;
+Battle.prototype.getRandomTarget = function(pokemon, move) {
+  if (!isRaid(this)) return oldGetRandomTarget.call(this, pokemon, move);
+  if (move.target === 'self' || move.target === 'allies' || move.target === 'allySide' || move.target === 'allyTeam') return pokemon;
+  const foes = pokemon.foes().filter(p => p && !p.fainted);
+  return foes.length ? this.sample(foes) : null;
+};
+
+const oldCheckWin = Battle.prototype.checkWin;
+Battle.prototype.checkWin = function(faintData) {
+  if (!isRaid(this)) return oldCheckWin.call(this, faintData);
+  const boss = bossSide(this);
+  if (!boss || boss.pokemonLeft <= 0) {
+    const survivingPlayer = this.sides.find(isActivePlayerSide);
+    return this.win(survivingPlayer || null);
+  }
+  if (!this.sides.some(isActivePlayerSide)) return this.win(boss);
+  return false;
+};
+
+const oldStart = Battle.prototype.start;
+Battle.prototype.start = function() {
+  if (!isRaid(this)) return oldStart.apply(this, arguments);
+  if (this.deserialized) return;
+  if (!this.sides.every(side => !!side)) throw new Error(`Missing sides: ${this.sides}`);
+  if (this.started) throw new Error('Battle already started');
+  if (this.sides.length < 2) throw new Error('Raid requires at least one player and one boss side');
+
+  this.started = true;
+  this.activePerHalf = 1;
+  for (const side of this.sides) raidNormalizeSide(side);
+  this.gameType = 'raid';
+  refreshOpponentAnchors(this);
+
+  const format = this.format;
+  this.add('gametype', 'raid');
+  for (const side of this.sides) this.add('teamsize', side.id, side.pokemon.length);
+  this.add('gen', this.gen);
+  this.add('tier', format.name);
+  if (format.onBegin) format.onBegin.call(this);
+  for (const rule of this.ruleTable.keys()) {
+    if ('+*-!'.includes(rule.charAt(0))) continue;
+    const sub = this.dex.formats.get(rule);
+    if (sub.onBegin) sub.onBegin.call(this);
+  }
+  if (this.sides.some(side => !side.pokemon[0])) throw new Error('Battle not started: A raid side has an empty team.');
+  if (this.debugMode) this.checkEVBalance();
+  if (format.onTeamPreview) format.onTeamPreview.call(this);
+  for (const rule of this.ruleTable.keys()) {
+    if ('+*-!'.includes(rule.charAt(0))) continue;
+    const sub = this.dex.formats.get(rule);
+    if (sub.onTeamPreview) sub.onTeamPreview.call(this);
+  }
+
+  const boss = bossSide(this)?.pokemon[0];
+  if (boss) boss.addVolatile('raidboss');
+
+  applyRaidField(this);
+
+  this.queue.addChoice({choice: 'start'});
+  this.midTurn = true;
+  if (!this.requestState) this.go();
+};
+
+/**
+ * The field conditions an owner asked for (EncounterRules.weather / .terrain).
+ *
+ * They arrive as `raidWeather` and `raidTerrain` on the format, which survives because Showdown's
+ * BasicEffect constructor does `Object.assign(this, data)` over the `>start` payload's format
+ * object. The `raid` prefix is not decoration: Format already has its own `weather` field, and
+ * writing to that would mean something quite different.
+ *
+ * Duration is pinned to 0, which is Showdown's "does not expire". A field condition drafted as a
+ * challenge for the whole fight would be an odd thing to have run out after five turns, and the
+ * party has no way to renew it.
+ *
+ * The boss is passed as the source explicitly. `setWeather`/`setTerrain` fall back to
+ * `battle.event.target` when no source is given, and there is no ambient event this early --
+ * `start()` runs outside any event dispatch -- so an id with a `durationCallback` (every real
+ * weather; terrain always requires one) throws `setting weather/terrain without a source` instead
+ * of applying. The live test caught this: the field was silently never set, and the exception
+ * landed in the catch below instead, reporting a failure with no reader watching for one.
+ *
+ * Wrapped, because a weather id that Showdown does not know must cost the battle its weather and
+ * nothing else. The alternative is an exception inside `start`, which takes the whole raid with it.
+ */
+function applyRaidField(battle) {
+  const format = battle.format || {};
+  const weather = format.raidWeather;
+  const terrain = format.raidTerrain;
+  if (!weather && !terrain) return;
+  const source = bossSide(battle)?.pokemon[0] || null;
+  try {
+    if (weather) {
+      battle.field.setWeather(weather, source);
+      if (battle.field.weatherState) battle.field.weatherState.duration = 0;
+      // Read back what the field HOLDS, never what we asked for: an id Showdown does not know
+      // fails quietly here, and reporting the request would make that look like success.
+      battle.add('-raidfield', 'weather', weather, battle.field.weather || '');
+    }
+    if (terrain) {
+      battle.field.setTerrain(terrain, source);
+      if (battle.field.terrainState) battle.field.terrainState.duration = 0;
+      battle.add('-raidfield', 'terrain', terrain, battle.field.terrain || '');
+    }
+  } catch (err) {
+    battle.add('-raidfield', 'error', weather || terrain || '', '');
+    battle.add('message', `Raid field condition could not be applied: ${err && err.message}`);
+  }
+}
+
+// The boss is AI-controlled by CobbleRaids/Cobblemon and never waits on a human input stream.
+const oldMakeRequest = Battle.prototype.makeRequest;
+Battle.prototype.makeRequest = function(type) {
+  if (!isRaid(this)) return oldMakeRequest.apply(this, arguments);
+  refreshOpponentAnchors(this);
+  const result = oldMakeRequest.apply(this, arguments);
+  // A withdrawn player remains a Cobblemon BattleActor until the shared battle ends, but their
+  // Showdown side must never block later turns waiting for another choice. Keep its real Pokemon
+  // state untouched and convert its request to a passive wait state.
+  for (const side of this.sides) {
+    if (!isPlayerSide(side) || (!side.raidWithdrawn && !isEliminatedPlayerSide(side))) continue;
+    if (isEliminatedPlayerSide(side)) side.raidEliminated = true;
+    passivatePlayerSide(side);
+  }
+  refreshOpponentAnchors(this);
+  const boss = bossSide(this);
+  if (type === 'move' && boss && boss.requestState === 'move' && boss.active[0] && !boss.active[0].fainted) {
+    boss.chooseMove('', 0);
+  }
+  return result;
+};
+
+const oldSendUpdates = Battle.prototype.sendUpdates;
+Battle.prototype.sendUpdates = function() {
+  if (isRaid(this)) {
+    this.sides.forEach(raidNormalizeSide);
+    refreshOpponentAnchors(this);
+  }
+  return oldSendUpdates.apply(this, arguments);
+};
+
+const oldSetPlayer = Battle.prototype.setPlayer;
+Battle.prototype.setPlayer = function(slot, options) {
+  const result = oldSetPlayer.call(this, slot, options);
+  if (isRaid(this)) {
+    const side = this.sides[parseInt(slot.slice(1), 10) - 1];
+    if (side) side.id = slot;
+    this.activePerHalf = 1;
+  }
+  return result;
+};
+
+module.exports = {isRaid, bossIndex, bossSide, isBossSide, isPlayerSide, isEliminatedPlayerSide, bossLateMoveUnusable};
+
+// Controlled cooperative victory command. Cobblemon writes Showdown INPUT, so emitting a raw
+// "|win|..." line from Java is invalid. >raidwin is consumed here and produces the normal
+// Showdown OUTPUT line that Cobblemon's WinInstruction already understands.
+const {BattleStream} = require('./sim/battle-stream');
+const oldWriteLine = BattleStream.prototype._writeLine;
+BattleStream.prototype._writeLine = function(type, message) {
+  if (!this.battle || !isRaid(this.battle)) {
+    return oldWriteLine.call(this, type, message);
+  }
+
+  if (type === 'raidleave') {
+    const battle = this.battle;
+    if (battle.ended) return false;
+    const side = battle.getSide(message.trim());
+    if (!side || !isPlayerSide(side) || side.raidWithdrawn) return false;
+    side.raidWithdrawn = true;
+    passivatePlayerSide(side);
+    refreshOpponentAnchors(battle);
+    battle.inputLog.push(`>raidleave ${side.id}`);
+    battle.add('-message', `${side.name} withdrew from the raid.`);
+    // Do not change Pokemon HP/fainted state here. Cobblemon will commit the legitimate state
+    // accumulated before withdrawal when the shared battle finally ends.
+    if (battle.requestState && battle.allChoicesDone()) battle.commitDecisions();
+    battle.sendUpdates();
+    return true;
+  }
+
+  // A disconnect that may reconnect: the reconnect-grace window in RaidReconnectService (Java).
+  // Reuses raidWithdrawn/passivatePlayerSide -- the exact machinery >raidleave already relies on to
+  // keep a shared turn from stalling on a side that will never answer -- rather than a second
+  // mechanism, since that path is the one this exact battle model has already proven safe. The only
+  // difference from >raidleave is that this is reversible: >raidresume below flips the same flag
+  // back. isChoiceDone() short-circuits on side.requestState, which this never touches, so flipping
+  // raidWithdrawn mid-turn cannot re-stall a turn already past that side's request -- the side simply
+  // gets a normal, real request the next time makeRequest runs, exactly like every other side.
+  if (type === 'raidhold') {
+    const battle = this.battle;
+    if (battle.ended) return false;
+    const side = battle.getSide(message.trim());
+    if (!side || !isPlayerSide(side) || side.raidWithdrawn) return false;
+    side.raidWithdrawn = true;
+    passivatePlayerSide(side);
+    refreshOpponentAnchors(battle);
+    battle.inputLog.push(`>raidhold ${side.id}`);
+    battle.add('-message', `${side.name} lost connection. Holding their raid slot.`);
+    if (battle.requestState && battle.allChoicesDone()) battle.commitDecisions();
+    battle.sendUpdates();
+    return true;
+  }
+
+  if (type === 'raidresume') {
+    const battle = this.battle;
+    if (battle.ended) return false;
+    const side = battle.getSide(message.trim());
+    if (!side || !isPlayerSide(side) || !side.raidWithdrawn) return false;
+    side.raidWithdrawn = false;
+    refreshOpponentAnchors(battle);
+    // The turn already in progress was requested while this side was held, so its request is the
+    // synthetic "wait" and nothing will re-issue it: the resumed player would sit with no prompt while
+    // everyone else waits on them (found by validation/showdown_fuzz.js -- the last player standing,
+    // held and resumed). Rebuild just this side's real request. getRequests() is pure, and a side's
+    // requestState is derived from its active request, so this is all it takes to owe a choice again.
+    if (battle.requestState === 'move' && !isEliminatedPlayerSide(side)) {
+      const real = battle.getRequests('move')[side.n];
+      if (real && !real.wait) {
+        side.clearChoice();
+        side.emitRequest(real);
+      }
+    }
+    battle.inputLog.push(`>raidresume ${side.id}`);
+    battle.add('-message', `${side.name} reconnected and rejoined the raid.`);
+    battle.sendUpdates();
+    return true;
+  }
+
+  if (type === 'raidwin') {
+    const battle = this.battle;
+    if (battle.ended) return false;
+    battle.inputLog.push(`>raidwin ${message}`);
+    battle.winner = message;
+    battle.add('');
+    battle.add('win', message);
+    battle.updatePP();
+    battle.ended = true;
+    battle.requestState = '';
+    for (const side of battle.sides) if (side) side.activeRequest = null;
+    battle.sendUpdates();
+    return true;
+  }
+
+  // Showdown's own BattleStream command dispatcher hardcodes the side commands as four literal
+  // switch cases, `case "p1": case "p2": case "p3": case "p4":`, and everything else falls through
+  // to `default: throw new Error('Unrecognized command ...')`. A raid needs one side per player
+  // plus one for the boss, so a four-player raid addresses p5 -- and every ">p5 team 1" / ">p5 move
+  // n" Cobblemon wrote therefore threw instead of being applied.
+  //
+  // That throw was invisible and fatal. BattleStream#_write catches it and calls
+  // pushError(err, true): "recoverable", so the stream stays open. But the sole consumer of the
+  // stream is the `for await` in Cobblemon's index.js, and the next read rethrows the parked error
+  // straight through it. With no catch there, that consumer died and every later simulator output
+  // piled up unread -- the battle kept running perfectly and Java never heard another word from it.
+  // See ShowdownIntegrationInstaller#patchOutputPump, which makes that consumer survive; this is
+  // the underlying cause it was hiding.
+  //
+  // p1..p4 are deliberately left to stock Showdown untouched; only the sides it cannot address at
+  // all are handled here. Of those, the boss side is dropped rather than applied: the boss is
+  // AI-controlled, makeRequest above has already answered its request with chooseMove(), and
+  // replaying Cobblemon's own late boss choice on top only clears that completed choice and
+  // replaces it with an invalid one ("Can't move: Your Kommo-o doesn't have a move 2"), which
+  // leaves the side with no choice at all and hangs the turn. Dropping it is also exactly what
+  // used to happen before this branch existed -- minus the throw that was the actual bug.
+  const sideNumber = /^p(\d+)$/.exec(type);
+  if (sideNumber && Number(sideNumber[1]) > 4) {
+    const side = this.battle.getSide(type);
+    if (!side) return false;
+    if (isBossSide(side)) return true;
+    if (message === 'undo') this.battle.undoChoice(type);
+    else this.battle.choose(type, message);
+    return true;
+  }
+
+  // The same late boss choice reaches the boss on p2..p4 too, and there it IS applied -- the AI's
+  // pick is meant to win over the pre-fill. But Showdown's choose() clears the side's existing choice
+  // BEFORE it validates the new one, so when the AI names a move the boss cannot use (Taunt, Disable,
+  // Torment... switch it off between the AI's request and its answer) the pre-fill is wiped and the
+  // new choice is then rejected with "[Unavailable choice] Can't move: X is disabled". The side is
+  // left with no choice at all, the shared turn waits on it forever, and nothing throws -- the raid
+  // just freezes. Reproduced in the sim with Taunt: boss done:false [] after the late choice.
+  // A late choice for an unusable move is dropped instead, leaving the valid pre-fill in place;
+  // no error is emitted, so Cobblemon has no invalid choice to react to either.
+  //
+  // The predicate only knows the cases already seen, so the rest is a transaction: a late boss choice
+  // that leaves a previously complete side incomplete is rolled back. Whatever else Showdown decides
+  // to reject -- a slot the request does not list, a switch the boss cannot make, a target -- the boss
+  // can never be left with nothing. Cobblemon still sees the |error| and may re-ask; that is harmless.
+  const bossSideNow = sideNumber ? this.battle.getSide(type) : null;
+  if (bossSideNow && isBossSide(bossSideNow)) {
+    if (bossLateMoveUnusable(bossSideNow, message)) return true;
+    const turn = this.battle.turn;
+    const state = bossSideNow.requestState;
+    const snapshot = bossSideNow.isChoiceDone() ? snapshotChoice(bossSideNow) : null;
+    const result = oldWriteLine.call(this, type, message);
+    if (snapshot && this.battle.turn === turn && bossSideNow.requestState === state && !bossSideNow.isChoiceDone()) {
+      bossSideNow.choice = snapshot;
+    }
+    return result;
+  }
+
+  return oldWriteLine.call(this, type, message);
+};
+
+/**
+ * A forced-switch request whose only owner was a withdrawn player is answered for them in
+ * passivatePlayerSide, inside makeRequest -- and nobody is left to send the choice that would
+ * normally trigger the commit, because stock Showdown commits from choose(). Without this the raid
+ * freezes for everyone (found by validation/showdown_fuzz.js): a held player's Pokemon faints, every
+ * other side waits, and neither resuming nor leaving re-asks.
+ *
+ * It runs after an input has been fully handled rather than from inside makeRequest, because
+ * commitDecisions() re-enters go(): called mid-go it would let the outer loop advance the turn a
+ * second time. Only 'switch' is committed this way -- a 'move' request with every human passive is
+ * the deliberate "wait for the party to come back" state (RaidReconnectService#hasActivePresence).
+ */
+function commitStuckForcedSwitch(battle) {
+  for (let guard = 0; guard < 8 && isRaid(battle) && battle.requestState === 'switch' && !battle.ended &&
+      battle.allChoicesDone(); guard++) {
+    battle.commitDecisions();
+  }
+}
+
+const innerWriteLine = BattleStream.prototype._writeLine;
+BattleStream.prototype._writeLine = function(type, message) {
+  try {
+    return innerWriteLine.call(this, type, message);
+  } finally {
+    commitStuckForcedSwitch(this.battle);
+  }
+};
+
+/** A copy of everything Side#choose clears, so a rejected replacement can be undone. */
+function snapshotChoice(side) {
+  const choice = side.choice;
+  return {
+    ...choice,
+    actions: choice.actions.map(action => ({...action})),
+    switchIns: new Set(choice.switchIns),
+    error: '',
+  };
+}
+
+/**
+ * True when a boss's "move ..." choice names a slot that is missing, disabled (visibly or hidden) or
+ * out of the boss's own moves. Anything that is not a plain move choice -- a switch, "default",
+ * "undo" -- is never treated as unusable here, so only the one known-fatal case changes behaviour.
+ */
+function bossLateMoveUnusable(side, message) {
+  const match = /^move\s+(\S+)/.exec(String(message).trim());
+  if (!match) return false;
+  const pokemon = side && side.active && side.active[0];
+  if (!pokemon || pokemon.fainted) return false;
+  const token = match[1];
+  const index = /^\d+$/.test(token) ? Number(token) - 1 : -1;
+  const slot = index >= 0
+    ? pokemon.moveSlots[index]
+    : pokemon.moveSlots.find(move => move.id === token.toLowerCase().replace(/[^a-z0-9]/g, ''));
+  if (!slot) return true;
+  const request = side.activeRequest && side.activeRequest.active && side.activeRequest.active[0];
+  // The request is what Showdown validates against, and it can list fewer moves than the Pokemon
+  // knows (a locked move, or Struggle once every move is out of PP).
+  if (request && request.moves && index >= 0 && index >= request.moves.length) return true;
+  const requested = request && request.moves && index >= 0 ? request.moves[index] : null;
+  return Boolean(slot.disabled || (requested && requested.disabled));
+}
+
+// Extension modules other mods registered through CobbleRaids' ShowdownExtensions API, installed beside this file
+// as ext-<id>.js. Loaded last, in name order, so everything above is already in place for them to build on.
+//
+// The list comes from extensions.js, which the Java installer writes, and NOT from scanning the directory: this runs
+// inside Cobblemon's GraalJS context, where Node built-ins such as the file-system module do not exist (asking for it
+// throws "Cannot load module"). Only plain relative require() of a file works there.
+//
+// Each is isolated: a module that throws while loading is reported and skipped. It must never be allowed to
+// throw out of here, because this file is required from index.js, and an exception at that point would take the
+// whole simulator -- every battle on the server -- down for the sake of somebody else's patch.
+try {
+  let ids = [];
+  try {
+    ids = require('./extensions.js');
+  } catch (err) {
+    // No manifest means nothing registered an extension (or this install predates the API), which is fine -- but say
+    // so, once per boot: a manifest that EXISTS and cannot be read looks exactly the same, and silence is how the
+    // first version of this loader failed unnoticed.
+    console.log('[CobbleRaids] No Showdown extension manifest was loaded: ' + ((err && err.message) || err));
+  }
+  for (const id of Array.isArray(ids) ? ids : []) {
+    if (typeof id !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,47}$/.test(id)) continue;
+    try {
+      require('./ext-' + id + '.js');
+      console.log('[CobbleRaids] Showdown extension ' + id + ' loaded.');
+    } catch (err) {
+      console.log('[CobbleRaids] Showdown extension ' + id + ' failed to load and was skipped: ' + ((err && err.stack) || err));
+    }
+  }
+} catch (err) {
+  console.log('[CobbleRaids] Could not load Showdown extensions: ' + ((err && err.stack) || err));
+}
