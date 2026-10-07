@@ -16,9 +16,6 @@ wears the boss down.
 | Fabric API | 0.116.6+1.21.1 |
 | Cobblemon | exactly 1.7.3 |
 
-**Optional.** `SkiesGUIs` 1.8.1 gives reward claiming a chest GUI; without it the same
-rewards are claimed from chat with `/cobbleraids reward claim`, and a SkiesGUIs that
-fails to load degrades to that fallback rather than aborting server start.
 The reward loot tables are built in. Items from these Cobblemon add-ons are rewarded only when the
 add-on is installed, and each is skipped silently when it is not: `mega_showdown`, `simpletms`,
 `cobblemoncharms`, `cobblemon-cards`, `cobblecapsule`, `companion_bonds`, `daycareplus`,
@@ -175,6 +172,7 @@ definition can reward exactly one add-on. Each is skipped when its mod is not in
 accident rather than on purpose.
 
 ### The raid shop
+This was designed to be used with a server economy in mind.
 
 Items are priced in Raid Points, with per-player limits that reset daily, weekly (Monday, UTC) or
 never; everything lives in `config/cobbleraids/shop.json`. Exp candies are priced so a level costs
