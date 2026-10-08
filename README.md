@@ -14,7 +14,7 @@ wears the boss down.
 | Java | 21 |
 | Fabric Loader | 0.17.2+ |
 | Fabric API | 0.116.6+1.21.1 |
-| Cobblemon | exactly 1.7.3 |
+| Cobblemon | exactly 1.8.1 |
 
 The reward loot tables are built in. Items from these Cobblemon add-ons are rewarded only when the
 add-on is installed, and each is skipped silently when it is not: `mega_showdown`, `simpletms`,
