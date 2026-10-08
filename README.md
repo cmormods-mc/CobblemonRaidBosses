@@ -1,4 +1,4 @@
-# CobbleRaids
+# CobblemonRaidBosses
 
 Cooperative wild raid bosses for **Cobblemon 1.8.1** on **Minecraft 1.21.1 / Fabric**.
 
