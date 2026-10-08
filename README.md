@@ -1,6 +1,6 @@
 # CobbleRaids
 
-Cooperative wild raid bosses for **Cobblemon 1.7.3** on **Minecraft 1.21.1 / Fabric**.
+Cooperative wild raid bosses for **Cobblemon 1.8.1** on **Minecraft 1.21.1 / Fabric**.
 
 Right-click a wild boss to open a recruitment window, up to four players join, and
 one shared Showdown battle runs against a single boss HP pool with per-player
